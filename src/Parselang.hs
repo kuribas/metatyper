@@ -17,7 +17,8 @@ data GlyphParseState = GlyphParseState {
   stateGlyphData :: GlyphData,
   stateFunctions :: HM.HashMap String [TypedVal],
   stateExprParser :: MetaParser TypedVal,
-  stateInfixFunctions :: HM.HashMap String [TypedVal]}
+  stateInfixFuns :: HM.HashMap String [TypedVal],
+  stateInfixOps :: HM.HashMap String (Int, [TypedVal])}
 
 modifyGlyphData :: (GlyphData -> GlyphData) ->  GlyphParseState -> GlyphParseState
 modifyGlyphData f state =
@@ -117,7 +118,7 @@ varOrApp = spacedAfter $ do
       setSyntax pos (FunctionTok a)
       foldr1 (<|>) $ map (try . parseFun) f
     Nothing
-      | isJust (HM.lookup a $ stateInfixFunctions state) -> fail ""
+      | isJust (HM.lookup a $ stateInfixFuns state) -> fail ""
       | otherwise -> do
         name <- Name a `liftM` sepBy suffix (optional $ char '.')
         if H.member name (glyphParams $ stateGlyphData state)
@@ -233,16 +234,16 @@ infixFuns = do
   pos <- getPosition
   state <- getState
   a <- many1 letter
-  case HM.lookup a (stateInfixFunctions state) of
+  case HM.lookup a (stateInfixFuns state) of
     Just l -> setSyntax pos (InfixTok a) >> return l
     Nothing -> fail ""
 
 infixApp :: TypedVal -> MetaParser TypedVal
 infixApp t = do
   (do funs <- try infixFuns
-      if null funs then fail ""
-        else (foldr1 (<|>) $ map (try . appInfix t) funs)
-             >>= infixApp
+      when (null funs) (fail "")
+      (foldr1 (<|>) $ map (try . appInfix t) funs)
+        >>= infixApp
     ) <|> return t
 
 appInfix :: TypedVal -> TypedVal -> MetaParser TypedVal
@@ -253,7 +254,38 @@ appInfix t (TypedVal (FunType a b) f) = do
 
 appInfix _ _ = fail "Invalid function"
 
+-- find the next operator and check fixity
+operator :: Int -> MetaParser (Int, String, [TypedVal])
+operator n = spacedAfter $ do
+  state <- getState
+  pos <- getPosition
+  s <- many1 $ oneOf "<=>:|+-/*\\!?#&@^~"
+  setSyntax pos (InfixTok s)
+  case HM.lookup s (stateInfixOps state) of
+    Nothing -> fail ""
+    Just (m, f)
+      | m < n -> fail ""
+      | otherwise -> return (m, s, f)
+
+applyInfixOp :: TypedVal -> TypedVal -> TypedVal -> MetaParser TypedVal
+applyInfixOp v1 v2 (TypedVal (FunType t1 (FunType t2 t3)) f) =
+  case (fromType t1 v1, fromType t2 v2) of
+    (Just r1, Just r2) -> return $ TypedVal t3 $ f r1 r2
+    _ -> fail ""
+
+applyInfixOp _ _ _ = fail "Illegal function"
+
+getInfixOp :: Int -> TypedVal -> MetaParser TypedVal
+getInfixOp n v@(TypedVal t1 _)  =
+  (do (m, s, funs) <- try $ operator n
+      next <- term
+      v2@(TypedVal t2 _) <- getInfixOp m next
+      res <- foldr (<|>)
+             (fail $ typeStr t1 ++ " " ++ s ++ " " ++
+              typeStr t2 ++ " not defined.") $
+             map (applyInfixOp v v2) funs
+      getInfixOp n res
+  ) <|> return v
+
 expression :: MetaParser TypedVal
-expression = do
-  s <- getState
-  stateExprParser s
+expression = infixTerm >>= getInfixOp 0
