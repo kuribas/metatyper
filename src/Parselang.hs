@@ -6,6 +6,7 @@ import Language
 import Data.Char
 import Data.Maybe
 import Control.Monad
+import Control.Applicative ((<$>))
 import Text.Parsec
 import qualified Data.HashMap.Strict as HM
 import qualified Data.HashSet as H
@@ -16,9 +17,30 @@ type MetaParser a = Parsec String GlyphParseState a
 data GlyphParseState = GlyphParseState {
   stateGlyphData :: GlyphData,
   stateFunctions :: HM.HashMap String [TypedVal],
-  stateExprParser :: MetaParser TypedVal,
+  stateDeps :: Deps,
   stateInfixFuns :: HM.HashMap String [TypedVal],
   stateInfixOps :: HM.HashMap String (Int, [TypedVal])}
+
+makeGlyphData :: [Name] -> GlyphData
+makeGlyphData params vars = GlyphData {
+  glyphParams = H.fromList params,
+  glyphVars = vars,
+  glyphHighlight = M.empty,
+  glyphPathOperations = [],
+  glyphEmptyVars = []}
+
+makeParseState :: HM.HashMap String [TypedVal]
+               -> HM.HashMap String [TypedVal]
+               -> HM.HashMap String (Int, [TypedVal])
+               -> [Name] -> GlyphParseState
+makeParseState funs vars infixFunctions infixOps params =
+  GlyphParseState {
+    stateGlyphData = makeGlyphData params vars,
+    stateFunctions = funs,
+    stateInfixFuns = infixFunctions,
+    stateDeps = emptyDeps,
+    stateInfixOps = infixOps
+    }
 
 modifyGlyphData :: (GlyphData -> GlyphData) ->  GlyphParseState -> GlyphParseState
 modifyGlyphData f state =
@@ -98,14 +120,14 @@ interpolate = spacedAfter $ do
   void $ someSpace >> char ']'
   case (a, b) of
     (TypedVal NumType dlA, TypedVal NumType dlB) ->
-      return $ \x -> TypedVal NumType $ (1-x)*dlA + x*dlB
+      return $ \x -> addType $ (1-x)*dlA + x*dlB
     (TypedVal PairType (Pair dlAx dlAy), TypedVal PairType (Pair dlBx dlBy)) ->
-      return $ \x -> TypedVal PairType $ Pair ((1-x)*dlAx + x*dlBx) ((1-x)*dlAy + x*dlBy)
+      return $ \x -> addType $ Pair ((1-x)*dlAx + x*dlBx) ((1-x)*dlAy + x*dlBy)
     _ -> fail "Can only interpolate between numeric or pair"
 
 suffix :: MetaParser Suffix
-suffix = (Tag `liftM` many1 letter) <|>
-         (SuffixIndex `liftM` decimal)
+suffix = (Tag <$> many1 letter) <|>
+         (SuffixIndex <$> decimal)
 
 varOrApp :: MetaParser TypedVal
 varOrApp = spacedAfter $ do
@@ -120,7 +142,7 @@ varOrApp = spacedAfter $ do
     Nothing
       | isJust (HM.lookup a $ stateInfixFuns state) -> fail ""
       | otherwise -> do
-        name <- Name a `liftM` sepBy suffix (optional $ char '.')
+        name <- Name a <$> sepBy suffix (optional $ char '.')
         if H.member name (glyphParams $ stateGlyphData state)
            -- parameter
           then do setSyntax pos (ParameterTok name)
@@ -158,7 +180,7 @@ parseFun fun@(TypedVal (FunType a b) f) = do
     FunType _ _ ->
       char '(' >> someSpace >>
       parseArgList fun
-    _ -> liftM (TypedVal b . f) $ castType a term
+    _ -> (TypedVal b . f) <$> castType a term
 
 parseFun val = return val
 
@@ -179,7 +201,7 @@ term = spacedAfter $ do
   t <- simpleTerm
   case t of
     TypedVal NumType dl ->
-      ($dl) `liftM` option (TypedVal NumType) interpolate
+      ($dl) <$> option (TypedVal NumType) interpolate
     _ -> return t
 
 optNegate :: MetaParser TypedVal -> MetaParser TypedVal
@@ -226,6 +248,7 @@ subExpr = spacedAfter $ do
              return $ TypedVal PairType $ Pair e e2
     _ -> someSpace >> char ')' >> return (TypedVal t e)
 
+-- term with optional infix function application
 infixTerm :: MetaParser TypedVal
 infixTerm = term >>= infixApp
 
@@ -238,14 +261,16 @@ infixFuns = do
     Just l -> setSyntax pos (InfixTok a) >> return l
     Nothing -> fail ""
 
+-- optionally parse and apply an infix function
 infixApp :: TypedVal -> MetaParser TypedVal
 infixApp t = do
   (do funs <- try infixFuns
-      when (null funs) (fail "")
+      when (null funs) (fail "Empty function definition.")
       (foldr1 (<|>) $ map (try . appInfix t) funs)
         >>= infixApp
     ) <|> return t
 
+-- apply infix function
 appInfix :: TypedVal -> TypedVal -> MetaParser TypedVal
 appInfix t (TypedVal (FunType a b) f) = do
   case fromType a t of
@@ -279,7 +304,7 @@ getInfixOp :: Int -> TypedVal -> MetaParser TypedVal
 getInfixOp n v@(TypedVal t1 _)  =
   (do (m, s, funs) <- try $ operator n
       next <- term
-      v2@(TypedVal t2 _) <- getInfixOp m next
+      v2@(TypedVal t2 _) <- getInfixOp (m+1) next
       res <- foldr (<|>)
              (fail $ typeStr t1 ++ " " ++ s ++ " " ++
               typeStr t2 ++ " not defined.") $
@@ -289,3 +314,41 @@ getInfixOp n v@(TypedVal t1 _)  =
 
 expression :: MetaParser TypedVal
 expression = infixTerm >>= getInfixOp 0
+
+pairEq :: Pair -> MetaParser ()
+pairEq e@(Pair x y) = do
+  void $ char '='; someSpace
+  Pair x2 y2 <- castType PairType expression
+  saveDeps $ (x, y) =&= (x2, y2)
+  pairEq e <|> return ()
+
+numericEq :: DepExp -> MetaParser ()
+numericEq e = do
+  void $ char '='; someSpace
+  e2 <- castType NumType expression
+  saveDeps $ e === e2
+  numericEq e <|> return ()
+
+saveDeps :: (Deps -> Either (DepError Expression) Deps) -> MetaParser ()
+saveDeps dep = do
+  state <- getState
+  case dep (stateDeps state) of
+    Left (UnknownUnary s) ->
+      fail $ "argument of  " ++ s ++ " must be a known variable."
+    Left (UnknownBinary s) ->
+      fail $ "argument of " ++ s ++ " must be a known variable."
+    Left (InconsistentEq a) ->
+      fail $ "Inconsistent Equation, off by " ++ show a
+    Left RedundantEq ->
+      fail "Redundant Equation."
+    Right deps -> setState $ state {stateDeps = deps}
+
+equations :: MetaParser ()
+equations = do
+  (TypedVal t v) <- expression
+  case t of
+    NumType -> numericEq v
+    PairType -> pairEq v
+    _ -> fail $ "expected <numeric expression> or <pair expression>."
+
+-- statement = declaration <|> equations <|> pathOp
